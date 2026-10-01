@@ -47,7 +47,7 @@ jobs:
       DB_USER: ${{ inputs.db_user }}
       DB_HOST: 127.0.0.1
       DB_PASSWORD: ${{ secrets.DB_PASSWORD || inputs.db_name }}
-      PMA_USER: pma
+      PMA_USER: ${{ secrets.PMA_USER || 'pma' }}
       PMA_PASSWORD: ${{ secrets.PMA_PASSWORD }}
       PMA_PORT: "8099"
       PAWNCC_URL: https://github.com/pawn-lang/compiler/releases/download/v3.10.10/pawnc-3.10.10-linux.tar.gz
@@ -193,15 +193,24 @@ jobs:
           if [ -z "$PW" ]; then
             PW="Pma-$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)"
             echo "GENERATED=true" >> "$GITHUB_OUTPUT"
+            echo "FROM_SECRET=false" >> "$GITHUB_OUTPUT"
           else
             echo "GENERATED=false" >> "$GITHUB_OUTPUT"
+            echo "FROM_SECRET=true" >> "$GITHUB_OUTPUT"
           fi
           printf 'PASSWORD=%s\n' "$PW" >> "$GITHUB_OUTPUT"
+          # Host matching must allow the user to connect over TCP (phpMyAdmin),
+          # so accept any host and backslash-escape wildcard chars just in case.
+          ESC_PW="${PW//\\/\\\\}"
+          ESC_PW="${ESC_PW//%/\\%}"
+          ESC_PW="${ESC_PW//_/\\_}"
           sudo mariadb <<SQL
-          CREATE USER IF NOT EXISTS '$PMA_USER'@'localhost' IDENTIFIED BY '$PW';
-          CREATE USER IF NOT EXISTS '$PMA_USER'@'127.0.0.1' IDENTIFIED BY '$PW';
+          CREATE USER IF NOT EXISTS '$PMA_USER'@'localhost' IDENTIFIED BY '$ESC_PW';
+          CREATE USER IF NOT EXISTS '$PMA_USER'@'127.0.0.1' IDENTIFIED BY '$ESC_PW';
+          CREATE USER IF NOT EXISTS '$PMA_USER'@'%' IDENTIFIED BY '$ESC_PW';
           GRANT ALL PRIVILEGES ON *.* TO '$PMA_USER'@'localhost' WITH GRANT OPTION;
           GRANT ALL PRIVILEGES ON *.* TO '$PMA_USER'@'127.0.0.1' WITH GRANT OPTION;
+          GRANT ALL PRIVILEGES ON *.* TO '$PMA_USER'@'%' WITH GRANT OPTION;
           FLUSH PRIVILEGES;
           SQL
           echo "phpMyAdmin user '$PMA_USER' ready"
@@ -354,7 +363,11 @@ jobs:
             echo "| Max players | $MAX_PLAYERS |"
             echo "| Local UDP port | $SAMP_PORT |"
             echo "| phpMyAdmin | [open](${{ steps.cf.outputs.url || 'tunnel unavailable' }}) |"
-            echo "| phpMyAdmin login | \`$PMA_USER\` / \`${{ steps.pma.outputs.PASSWORD }}\` |"
+            if [ "${{ steps.pma.outputs.FROM_SECRET }}" = "true" ]; then
+              echo "| phpMyAdmin login | \`$PMA_USER\` / _set via repository secret_ |"
+            else
+              echo "| phpMyAdmin login | \`$PMA_USER\` / \`${{ steps.pma.outputs.PASSWORD }}\` |"
+            fi
             echo "| Database | \`$DB_NAME\` on $DB_HOST |"
             echo "| Gamemode DB user | \`$DB_USER\` |"
             echo "| Game endpoint | ${{ steps.pg.outputs.endpoint || 'see job log' }} |"
@@ -362,10 +375,14 @@ jobs:
             if [ "${{ steps.pma.outputs.GENERATED }}" = "true" ]; then
               echo "> **The phpMyAdmin password above was generated at runtime and is printed here.**"
               echo "> This repository is **public**, so this summary is readable by anyone while the run is active."
-              echo "> Set the \`PMA_PASSWORD\` repository secret to choose your own password."
+              echo "> Set the \`PMA_PASSWORD\` repository secret to choose your own password and hide it."
+              echo
+            else
+              echo "> Credentials come from repository secrets and are not printed in this public summary."
               echo
             fi
             echo "### Notes"
+            echo "- The gamemode connects to the database with the \`$DB_USER\` / \`$DB_PASSWORD\` pair, so those also work as a phpMyAdmin login if you prefer."
             echo "- GitHub-hosted runners cannot accept inbound traffic, so the game port is relayed by a free third-party UDP tunnel (Pinggy). Its public port is assigned per connection and changes when the tunnel restarts."
             echo "- **The free Pinggy tunnel expires after 60 minutes.** The watchdog recreates it automatically and logs the new endpoint, but the address changes each time, so players must use the newest endpoint."
             echo "- The phpMyAdmin link is a Cloudflare quick tunnel: free, no account, HTTPS, but the hostname changes on every run and has no uptime guarantee."
