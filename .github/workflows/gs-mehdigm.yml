@@ -1,0 +1,446 @@
+name: GS MEHDIGM - SAMP Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_name:
+        description: "Hostname shown in the SA-MP server list"
+        required: false
+        default: "GM OVER CITY - Free CI Server"
+      samp_port:
+        description: "Local SAMP UDP port"
+        required: false
+        default: "7777"
+      max_players:
+        description: "maxplayers"
+        required: false
+        default: "100"
+      db_name:
+        description: "MySQL database name"
+        required: false
+        default: "overcity"
+      db_user:
+        description: "MySQL user used by the gamemode"
+        required: false
+        default: "samp"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gs-mehdigm-samp
+  cancel-in-progress: false
+
+jobs:
+  server:
+    name: SAMP + MariaDB + phpMyAdmin + free tunnels
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    env:
+      RUN: ${{ github.workspace }}
+      LOGS: ${{ runner.temp }}/gm-logs
+      SAMP_PORT: ${{ inputs.samp_port }}
+      MAX_PLAYERS: ${{ inputs.max_players }}
+      SERVER_NAME: ${{ inputs.server_name }}
+      DB_NAME: ${{ inputs.db_name }}
+      DB_USER: ${{ inputs.db_user }}
+      DB_HOST: 127.0.0.1
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD || inputs.db_name }}
+      PMA_USER: pma
+      PMA_PASSWORD: ${{ secrets.PMA_PASSWORD }}
+      PMA_PORT: "8099"
+      PAWNCC_URL: https://github.com/pawn-lang/compiler/releases/download/v3.10.10/pawnc-3.10.10-linux.tar.gz
+      CF_URL: https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+      WATCHDOG_SECONDS: "20000"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          echo "phpmyadmin phpmyadmin/reconfigure-webserver select none" | sudo debconf-set-selections
+          echo "phpmyadmin phpmyadmin/dbconfig-common boolean true"   | sudo debconf-set-selections
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            libc6-i386 lib32stdc++6 \
+            mariadb-server mariadb-client \
+            php-cli php-mysql php-mbstring php-xml phpmyadmin \
+            ca-certificates curl tar
+          sudo npm install -g pinggy --silent --no-fund --no-audit
+          mkdir -p "$LOGS" /var/lib/phpmyadmin/tmp
+          sudo chmod 1777 /var/lib/phpmyadmin/tmp
+          echo "--- installed ---"
+          php -v | head -1
+          mariadbd --version
+          pinggy --version 2>&1 | head -2
+
+      - name: Fetch tooling (pawncc + cloudflared)
+        run: |
+          set -euo pipefail
+          curl -fsSL "$PAWNCC_URL" -o /tmp/pawnc.tar.gz
+          sudo mkdir -p /opt/pawnc && sudo tar xzf /tmp/pawnc.tar.gz -C /opt/pawnc
+          curl -fsSL "$CF_URL" -o "$RUN/cloudflared"
+          chmod +x "$RUN/cloudflared"
+          echo "cloudflared: $("$RUN/cloudflared" --version 2>&1 | head -1)"
+          ls /opt/pawnc
+
+      - name: Recompile gamemode from source
+        run: |
+          set -euo pipefail
+          cd "$RUN"
+
+          mkdir -p "$LOGS"
+
+          python3 - <<'PY'
+          import io
+          p = "pawno/include/Pawn.CMD.inc"
+          s = io.open(p, encoding="utf-8", errors="replace").read()
+          before = s
+          # The SA-MP Windows compiler tolerates a stray ';' inside this macro pattern.
+          # pawn-lang pawncc does not, so normalise both halves idempotently.
+          s = s.replace("#define alias:%0(%1);", "#define alias:%0(%1)")
+          s = s.replace("                PC_RegAlias(#%0, %1);",
+                        "                PC_RegAlias(#%0, %1)")
+          if s != before:
+              io.open(p, "w", encoding="utf-8").write(s)
+              print("patched Pawn.CMD.inc alias macro")
+          else:
+              print("Pawn.CMD.inc alias macro already normalised")
+          PY
+
+          python3 - "$DB_HOST" "$DB_NAME" "$DB_USER" "$DB_PASSWORD" <<'PY'
+          import io, re, sys
+          host, name, user, pw = sys.argv[1:5]
+          p = "gamemodes/roleplay2.pwn"
+          s = io.open(p, encoding="utf-8", errors="replace").read()
+          repl = {
+              "MYSQL_HOSTNAME": host,
+              "MYSQL_DATABASE": name,
+              "MYSQL_USERNAME": user,
+              "MYSQL_PASSWORD": pw,
+          }
+          for macro, val in repl.items():
+              pat = re.compile(r"^[ \t]*#define[ \t]+" + macro + r".*$", re.M)
+              if pat.search(s):
+                  s = pat.sub('#define %s  "%s"' % (macro, val), s, count=1)
+              else:
+                  print("WARNING: %s not found in source" % macro)
+          io.open(p, "w", encoding="utf-8").write(s)
+          print("MySQL macros rewritten")
+          PY
+
+          grep -E '^#define MYSQL_(HOSTNAME|DATABASE|USERNAME|PASSWORD)' gamemodes/roleplay2.pwn | sed 's/^/  /'
+
+          mkdir -p "$RUN/pawnc/lib"
+          PAWN_BIN="$(dirname "$(find /opt/pawnc -name pawncc -type f | head -1)")"
+          sudo cp -a "$PAWN_BIN/../lib/." "$RUN/pawnc/lib/"
+          export LD_LIBRARY_PATH="$RUN/pawnc/lib"
+          PAWNCC="$(find /opt/pawnc -name pawncc -type f | head -1)"
+
+          echo "--- compiling roleplay2.pwn ---"
+          cd "$RUN/gamemodes"
+          set +e
+          "$PAWNCC" roleplay2.pwn -i../pawno/include -d0 WC_DEBUG=1 2>&1 | tee "$LOGS/compile.log" | grep -E ": error|Errors|Total requirements|Header size|Code size|Data size" || true
+          set -e
+          if [ ! -s roleplay2.amx ]; then
+            echo "FATAL: roleplay2.amx was not produced"
+            grep -E ": error" "$LOGS/compile.log" | head -20 || true
+            exit 1
+          fi
+          echo "OK: roleplay2.amx = $(stat -c %s roleplay2.amx) bytes"
+          echo "OK: pawno/include/pawncc = $(ls "$RUN/pawno/include" | wc -l) files"
+
+      - name: Start and seed MariaDB
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /run/mysqld
+          sudo chown mysql:mysql /run/mysqld
+          nohup sudo mariadbd-safe --user=mysql --bind-address=127.0.0.1 > "$LOGS/mariadb-boot.log" 2>&1 &
+          for i in $(seq 1 60); do
+            if sudo mariadb-admin ping >/dev/null 2>&1; then echo "MariaDB is alive after ${i}s"; break; fi
+            sleep 1
+          done
+          sudo mariadb-admin ping
+
+          sudo mariadb <<SQL
+          CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+          CREATE USER IF NOT EXISTS '$DB_USER'@'127.0.0.1' IDENTIFIED BY '$DB_PASSWORD';
+          CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
+          GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'127.0.0.1';
+          GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';
+          FLUSH PRIVILEGES;
+          SQL
+
+          echo "--- importing serverdatabase.sql ---"
+          sudo mariadb "$DB_NAME" < "$RUN/serverdatabase.sql"
+          TABLES=$(sudo mariadb -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME';")
+          echo "tables created: $TABLES"
+
+          # The shipped gamemode source is older than serverdatabase.sql and expects
+          # one extra column on `mdc`. Add it so the recompiled script loads clean.
+          sudo mariadb "$DB_NAME" -e \
+            "ALTER TABLE mdc ADD COLUMN IF NOT EXISTS pos_r FLOAT NOT NULL DEFAULT 0 AFTER pos_a;"
+          echo "mdc columns: $(sudo mariadb -N -B "$DB_NAME" -e 'SHOW COLUMNS FROM mdc;' | awk '{print $1}' | tr '\n' ' ')"
+
+      - name: Prepare phpMyAdmin credentials
+        id: pma
+        run: |
+          set -euo pipefail
+          PW="$PMA_PASSWORD"
+          if [ -z "$PW" ]; then
+            PW="Pma-$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)"
+            echo "GENERATED=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "GENERATED=false" >> "$GITHUB_OUTPUT"
+          fi
+          printf 'PASSWORD=%s\n' "$PW" >> "$GITHUB_OUTPUT"
+          sudo mariadb <<SQL
+          CREATE USER IF NOT EXISTS '$PMA_USER'@'localhost' IDENTIFIED BY '$PW';
+          CREATE USER IF NOT EXISTS '$PMA_USER'@'127.0.0.1' IDENTIFIED BY '$PW';
+          GRANT ALL PRIVILEGES ON *.* TO '$PMA_USER'@'localhost' WITH GRANT OPTION;
+          GRANT ALL PRIVILEGES ON *.* TO '$PMA_USER'@'127.0.0.1' WITH GRANT OPTION;
+          FLUSH PRIVILEGES;
+          SQL
+          echo "phpMyAdmin user '$PMA_USER' ready"
+
+      - name: Configure server.cfg
+        run: |
+          set -euo pipefail
+          cd "$RUN"
+          cp server.cfg "$LOGS/server.cfg.original"
+
+          # Git does not preserve the +x bit from the original archive.
+          chmod +x samp03svr samp-npc
+          chmod 644 gamemodes/*.amx filterscripts/*.amx
+          chmod 755 plugins/*.so
+          rm -f server_log.txt mysql_log.txt
+
+          sed -i -E "s|^[[:space:]]*filterscripts.*|filterscripts pcrpmap|" server.cfg
+          sed -i -E "s|^[[:space:]]*port[[:space:]]+.*|port $SAMP_PORT|" server.cfg
+          sed -i -E "s|^[[:space:]]*maxplayers[[:space:]]+.*|maxplayers $MAX_PLAYERS|" server.cfg
+          sed -i -E "s|^[[:space:]]*hostname[[:space:]]+.*|hostname $SERVER_NAME|" server.cfg
+          sed -i -E "s|^[[:space:]]*rcon_password.*|rcon_password ${RCON:-disabled}disabled|" server.cfg
+          echo "--- effective server.cfg ---"
+          grep -E '^(filterscripts|port|maxplayers|hostname|rcon_password|gamemode0|plugins|announce|query)' server.cfg
+
+      - name: Start SAMP server and verify
+        run: |
+          set -euo pipefail
+          cd "$RUN"
+          nohup ./samp03svr > "$LOGS/samp03svr.log" 2>&1 &
+          echo $! > "$LOGS/samp.pid"
+          for i in $(seq 1 90); do
+            if ! kill -0 "$(cat "$LOGS/samp.pid")" 2>/dev/null; then
+              echo "FATAL: samp03svr exited early"
+              tail -40 "$LOGS/samp03svr.log" || true
+              exit 1
+            fi
+            if ss -lun 2>/dev/null | grep -q ":$SAMP_PORT "; then
+              echo "SAMP is listening on UDP $SAMP_PORT after ${i}s"; break
+            fi
+            sleep 1
+          done
+          echo "--- gamemode load (from server_log.txt) ---"
+          grep -E "\[Script\]|SA-MP Dedicated Server|successfully loaded" server_log.txt | head -25 || true
+
+          LOADED=$(grep -cE "\[Script\] .* loaded" server_log.txt || true)
+          MYSQLERR=$(grep -c "field not found" mysql_log.txt 2>/dev/null || echo 0)
+          echo "script data lines: $LOADED | mysql field errors: $MYSQLERR"
+          if [ "$LOADED" -lt 1 ]; then
+            echo "WARNING: gamemode did not report any loaded data - check server_log.txt"
+          fi
+
+      - name: Start phpMyAdmin and verify
+        run: |
+          set -euo pipefail
+          nohup php -S "0.0.0.0:$PMA_PORT" -t /usr/share/phpmyadmin > "$LOGS/phpmyadmin.log" 2>&1 &
+          echo $! > "$LOGS/pma.pid"
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 10 "http://127.0.0.1:$PMA_PORT/" | grep -qi "phpmyadmin"; then
+              echo "phpMyAdmin responding locally after ${i}s"; break
+            fi
+            sleep 1
+          done
+          TITLE=$(curl -fsS --max-time 10 "http://127.0.0.1:$PMA_PORT/" | grep -oiE "<title>[^<]*</title>" | head -1 || true)
+          echo "local title: $TITLE"
+          if ! echo "$TITLE" | grep -qi "phpmyadmin"; then
+            echo "FATAL: phpMyAdmin is not being served on port $PMA_PORT"
+            ss -lptn "sport = :$PMA_PORT" 2>/dev/null | tail -3 || true
+            tail -20 "$LOGS/phpmyadmin.log" || true
+            exit 1
+          fi
+
+      - name: Start Cloudflare quick tunnel (phpMyAdmin)
+        id: cf
+        run: |
+          set -euo pipefail
+          cd "$RUN"
+          nohup ./cloudflared tunnel --no-autoupdate --url "http://localhost:$PMA_PORT" \
+            > "$LOGS/cloudflared.log" 2>&1 &
+          echo $! > "$LOGS/cf.pid"
+          URL=""
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOGS/cloudflared.log" | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 1
+          done
+          if [ -z "$URL" ]; then
+            echo "WARN: no trycloudflare URL obtained"; tail -20 "$LOGS/cloudflared.log" || true
+            echo "url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "quick tunnel URL: $URL"
+          OK=no
+          for i in $(seq 1 45); do
+            if curl -fsS --max-time 15 "$URL/" | grep -qi "phpmyadmin"; then OK=yes; echo "public phpMyAdmin verified after ${i} tries"; break; fi
+            sleep 2
+          done
+          [ "$OK" = yes ] || echo "WARN: public URL did not return phpMyAdmin yet (edge may still be warming up)"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Start Pinggy UDP tunnel (game server)
+        id: pg
+        run: |
+          set -euo pipefail
+          cd "$RUN"
+          cat > "$LOGS/tunnel_up.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          LOGS="$1"; SAMP_PORT="$2"
+          while true; do
+            pinggy -p 443 -R0:localhost:${SAMP_PORT} udp@free.pinggy.io \
+              > "${LOGS}/pinggy.log" 2>&1 &
+            PID=$!
+            echo "$PID" > "${LOGS}/ping.pid"
+            sleep 20
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "$(date -Is) pinggy died, restarting" >> "${LOGS}/tunnel_events.log"
+            fi
+            wait "$PID" || true
+            sleep 5
+          done
+          SH
+          chmod +x "$LOGS/tunnel_up.sh"
+          nohup "$LOGS/tunnel_up.sh" "$LOGS" "$SAMP_PORT" > "$LOGS/tunnel_supervisor.log" 2>&1 &
+          echo $! > "$LOGS/tunnel_sup.pid"
+          for i in $(seq 1 60); do
+            if [ -s "$LOGS/pinggy.log" ]; then break; fi
+            sleep 1
+          done
+          echo "--- pinggy output (ANSI stripped) ---"
+          sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r/\n/g' "$LOGS/pinggy.log" | grep -vE '^\s*$' | tail -20 || true
+          EP=$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOGS/pinggy.log" \
+               | grep -oE 'udp://[A-Za-z0-9.-]+:[0-9]+' | head -1 || true)
+          if [ -z "$EP" ]; then
+            EP=$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOGS/pinggy.log" \
+                 | grep -oE 'udp://[^ ]+' | head -1 | tr -d '[:space:]' || true)
+          fi
+          echo "game endpoint: ${EP:-unavailable}"
+          echo "endpoint=$EP" >> "$GITHUB_OUTPUT"
+
+      - name: Publish run summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## GM OVER CITY - SAMP Server is live"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Server | $SERVER_NAME |"
+            echo "| Gamemode | \`roleplay2\` (recompiled from \`roleplay2.pwn\`) |"
+            echo "| Max players | $MAX_PLAYERS |"
+            echo "| Local UDP port | $SAMP_PORT |"
+            echo "| phpMyAdmin | [open](${{ steps.cf.outputs.url || 'tunnel unavailable' }}) |"
+            echo "| phpMyAdmin login | \`$PMA_USER\` / \`${{ steps.pma.outputs.PASSWORD }}\` |"
+            echo "| Database | \`$DB_NAME\` on $DB_HOST |"
+            echo "| Gamemode DB user | \`$DB_USER\` |"
+            echo "| Game endpoint | ${{ steps.pg.outputs.endpoint || 'see job log' }} |"
+            echo
+            if [ "${{ steps.pma.outputs.GENERATED }}" = "true" ]; then
+              echo "> **The phpMyAdmin password above was generated at runtime and is printed here.**"
+              echo "> This repository is **public**, so this summary is readable by anyone while the run is active."
+              echo "> Set the \`PMA_PASSWORD\` repository secret to choose your own password."
+              echo
+            fi
+            echo "### Notes"
+            echo "- GitHub-hosted runners cannot accept inbound traffic, so the game port is relayed by a free third-party UDP tunnel (Pinggy). Its public port is assigned per connection and changes when the tunnel restarts."
+            echo "- **The free Pinggy tunnel expires after 60 minutes.** The watchdog recreates it automatically and logs the new endpoint, but the address changes each time, so players must use the newest endpoint."
+            echo "- The phpMyAdmin link is a Cloudflare quick tunnel: free, no account, HTTPS, but the hostname changes on every run and has no uptime guarantee."
+            echo "- The original \`roleplay2.amx\` in this repository is encrypted and does not match \`roleplay2.pwn\`, so the workflow recompiles the gamemode from source with working database credentials."
+            echo "- The job ends automatically after ~6 hours (GitHub's hard limit for a hosted job)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Watchdog - keep everything alive until timeout
+        run: |
+          set -uo pipefail
+          LIMIT="$WATCHDOG_SECONDS"
+          START=$SECONDS
+          RUN="$RUN"; LOGS="$LOGS"; SAMP_PORT="$SAMP_PORT"; PMA_PORT="$PMA_PORT"
+          STATUS_FILE="$LOGS/watchdog_status.md"
+
+          restart_samp() {
+            cd "$RUN"
+            nohup ./samp03svr >> "$LOGS/samp03svr.log" 2>&1 &
+            echo $! > "$LOGS/samp.pid"
+            echo "- $(date -Is) restarted samp03svr" >> "$STATUS_FILE"
+          }
+          restart_cf() {
+            cd "$RUN"
+            nohup ./cloudflared tunnel --no-autoupdate --url "http://localhost:$PMA_PORT" \
+              >> "$LOGS/cloudflared.log" 2>&1 &
+            echo $! > "$LOGS/cf.pid"
+            echo "- $(date -Is) restarted cloudflared" >> "$STATUS_FILE"
+          }
+          restart_ping() {
+            nohup "$LOGS/tunnel_up.sh" "$LOGS" "$SAMP_PORT" >> "$LOGS/tunnel_supervisor.log" 2>&1 &
+            echo $! > "$LOGS/tunnel_sup.pid"
+            echo "- $(date -Is) restarted pinggy tunnel" >> "$STATUS_FILE"
+          }
+
+          while [ $(( SECONDS - START )) -lt "$LIMIT" ]; do
+            sleep 60
+
+            if ! kill -0 "$(cat "$LOGS/samp.pid" 2>/dev/null || echo 0)" 2>/dev/null; then
+              echo "[watchdog] samp03svr is down"
+              restart_samp
+            fi
+
+            if ! kill -0 "$(cat "$LOGS/pma.pid" 2>/dev/null || echo 0)" 2>/dev/null; then
+              echo "[watchdog] php -S is down"
+              cd "$RUN"
+              nohup php -S "0.0.0.0:$PMA_PORT" -t /usr/share/phpmyadmin >> "$LOGS/phpmyadmin.log" 2>&1 &
+              echo $! > "$LOGS/pma.pid"
+              echo "- $(date -Is) restarted php built-in server" >> "$STATUS_FILE"
+            fi
+
+            if ! pgrep -f "cloudflared tunnel" >/dev/null 2>&1; then
+              echo "[watchdog] cloudflared is down"
+              restart_cf
+            fi
+
+            if ! pgrep -f "pinggy -p 443" >/dev/null 2>&1; then
+              echo "[watchdog] pinggy is down"
+              restart_ping
+            fi
+
+            ELAPSED=$(( (SECONDS - START) / 60 ))
+            if [ $(( ELAPSED % 30 )) -eq 0 ]; then
+              echo "[watchdog] alive, ${ELAPSED} min elapsed"
+            fi
+          done
+
+          echo "watchdog window elapsed"
+          if [ -s "$STATUS_FILE" ]; then
+            { echo; echo "### Auto-restarts during this run"; echo; cat "$STATUS_FILE"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: samp-server-logs
+          path: ${{ runner.temp }}/gm-logs
+          retention-days: 7
