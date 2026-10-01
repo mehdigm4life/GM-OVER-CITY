@@ -39,7 +39,7 @@ jobs:
 
     env:
       RUN: ${{ github.workspace }}
-      LOGS: ${{ runner.temp }}/gm-logs
+      LOGS: ${{ github.workspace }}/.gm-logs
       SAMP_PORT: ${{ inputs.samp_port }}
       MAX_PLAYERS: ${{ inputs.max_players }}
       SERVER_NAME: ${{ inputs.server_name }}
@@ -442,5 +442,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: samp-server-logs
-          path: ${{ runner.temp }}/gm-logs
+          path: ${{ github.workspace }}/.gm-logs
           retention-days: 7
